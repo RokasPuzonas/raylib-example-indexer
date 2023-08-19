@@ -15,7 +15,6 @@ raylib:
 
 run: raylib_example_indexer
 	./output/raylib_example_indexer output/raylib_api.txt output/raylib/examples output/output.json
-	./output/raylib_example_indexer output/raylib_api.txt output/raylib/examples output/output.csv
 
 all: raylib_api raylib run
 

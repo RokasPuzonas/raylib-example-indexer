@@ -28,11 +28,6 @@ typedef struct line_range {
 	int from, to; // [from, to) - from inclusive, to exclusive
 } line_range;
 
-typedef enum output_type {
-	OUTPUT_CSV,
-	OUTPUT_JSON,
-} output_type;
-
 static int get_file_size(FILE *file) {
 	fseek(file, 0, SEEK_END);
 	int size = ftell(file);
@@ -218,16 +213,6 @@ int main(int argc, char **argv) {
 		return -1;
 	}
 
-	output_type output_type;
-	if (!strcmp(output_extension, ".csv")) {
-		output_type = OUTPUT_CSV;
-	} else if (!strcmp(output_extension, ".json")) {
-		output_type = OUTPUT_JSON;
-	} else {
-		fprintf(stderr, "ERROR: Unknown file extension '%s', expected '.json' or '.csv'\n", output_extension);
-		return -1;
-	}
-
 	function_info funcs[MAX_FUNCS_TO_PARSE];
 	int funcs_count = 0;
 
@@ -270,59 +255,61 @@ int main(int argc, char **argv) {
 	}
 
 	// Output function usages
-	if (output_type == OUTPUT_CSV) {
-		FILE *output_file = fopen(output_path, "w");
-		if (output_file == NULL) {
-			fprintf(stderr, "Failed to open file '%s\n'", output_path);
-			return -1;
-		}
+	FILE *output_file = fopen(output_path, "w");
+	if (output_file == NULL) {
+		fprintf(stderr, "Failed to open file '%s\n'", output_path);
+		return -1;
+	}
 
-		char header[] = "file;line_number;line_offset;function\n";
-		fwrite(header, sizeof(char), sizeof(header)-1, output_file);
-		for (int func_idx = 0; func_idx < funcs_count; func_idx++) {
-			function_info *info = &funcs[func_idx];
-			for (int i = 0; i < usage_counts[func_idx]; i++) {
-				function_usage *usage = &usages[func_idx][i];
-				char row[1024];
-				int row_size = snprintf(row, sizeof(row), "%s;%d;%d;%.*s\n", usage->filename, usage->line_number, usage->line_offset, info->name_size, info->name);
-				fwrite(row, sizeof(char), row_size, output_file);
-			}
-		}
-		fclose(output_file);
-	} else if (output_type == OUTPUT_JSON) {
-		FILE *output_file = fopen(output_path, "w");
-		if (output_file == NULL) {
-			fprintf(stderr, "Failed to open file '%s\n'", output_path);
-			return -1;
-		}
+	fwrite("{\n", sizeof(char), 2, output_file);
+	for (int func_idx = 0; func_idx < funcs_count; func_idx++) {
+		function_info *info = &funcs[func_idx];
 
-		fwrite("[", sizeof(char), 1, output_file);
-		bool is_first = true;
-		for (int func_idx = 0; func_idx < funcs_count; func_idx++) {
-			function_info *info = &funcs[func_idx];
-			for (int i = 0; i < usage_counts[func_idx]; i++) {
+		fwrite("\t\"", sizeof(char), 2, output_file);
+		fwrite(info->name, sizeof(char), info->name_size, output_file);
+		fwrite("\": [", sizeof(char), 4, output_file);
+
+		int usage_count = usage_counts[func_idx];
+		if (usage_count > 0) {
+			fwrite("\n", sizeof(char), 1, output_file);
+
+			for (int i = 0; i < usage_count; i++) {
 				function_usage *usage = &usages[func_idx][i];
-				char entry[1024];
+				char *example_name = strchr(usage->filename, '/')+1;
+				int example_name_size = strchr(usage->filename, '.') - example_name;
+
 				char *entry_format = ""
-					"\t{\n"
-					"\t\t\"file\": \"%s\",\n"
-					"\t\t\"line_number\": %d,\n"
-					"\t\t\"line_offset\": %d,\n"
-					"\t\t\"function\": \"%.*s\"\n"
-					"\t}";
-				int entry_size = snprintf(entry, sizeof(entry), entry_format, usage->filename, usage->line_number, usage->line_offset, info->name_size, info->name);
-				if (!is_first) {
+					"\t\t{\n"
+					"\t\t\t\"exampleName\": \"%.*s\",\n"
+					"\t\t\t\"lineNumber\": %d,\n"
+					"\t\t\t\"lineOffset\": %d\n"
+					"\t\t}";
+				char entry[1024];
+				int entry_size = snprintf(entry, sizeof(entry), entry_format,
+						example_name_size,
+						example_name,
+						usage->line_number,
+						usage->line_offset);
+
+				fwrite(entry, sizeof(char), entry_size, output_file);
+				if (i < usage_count-1) {
 					fwrite(",", sizeof(char), 1, output_file);
 				}
 				fwrite("\n", sizeof(char), 1, output_file);
-				fwrite(entry, sizeof(char), entry_size, output_file);
-				is_first = false;
 			}
+
+			fwrite("\t", sizeof(char), 1, output_file);
 		}
 
-		fwrite("\n]\n", sizeof(char), 3, output_file);
-		fclose(output_file);
+		fwrite("]", sizeof(char), 1, output_file);
+		if (func_idx < funcs_count-1) {
+			fwrite(",", sizeof(char), 1, output_file);
+		}
+		fwrite("\n", sizeof(char), 1, output_file);
 	}
+
+	fwrite("}", sizeof(char), 1, output_file);
+	fclose(output_file);
 
 	for (int i = 0; i < funcs_count; i++) {
 		free(usages[i]);
