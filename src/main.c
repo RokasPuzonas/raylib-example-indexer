@@ -9,311 +9,297 @@
 
 #include "stb_c_lexer.h"
 
-#define MAX_FUNCS_TO_PARSE 1024 // Maximum number of functions to parse
-#define MAX_FUNC_USAGES    1024 // Maximum number of usages per function
+#include "raylib_parser.c"
 
-typedef struct function_info {
-    char name[64];
-	int name_size;
-	int param_count;
-} function_info;
+#define MAX_FUNCS_TO_PARSE    1024 // Maximum number of functions to parse
+#define MAX_FUNCS_PER_EXAMPLE 1024 // Maximum number of usages per function per file
 
-typedef struct function_usage {
-	char filename[PATH_MAX];
-	int line_number;
-	int line_offset;
-} function_usage;
+typedef struct {
+    char filename[256];
+    // TODO: Track where function usage was found and display it?
+} FunctionUsage;
 
-typedef struct line_range {
-	int from, to; // [from, to) - from inclusive, to exclusive
-} line_range;
+typedef struct {
+    int from, to; // [from, to) - from inclusive, to exclusive
+} LineRange;
 
-static int get_file_size(FILE *file) {
-	fseek(file, 0, SEEK_END);
-	int size = ftell(file);
-	fseek(file, 0, SEEK_SET);
-	return size;
+static bool StartsWith(char *text, int textSize, char *prefix, int prefixSize)
+{
+    return textSize >= prefixSize && !strncmp(text, prefix, prefixSize);
 }
 
-static bool get_next_line(line_range *line, char *text, int text_size, int from) {
-	for (int i = from; i < text_size; i++) {
-		if (text[i] == '\n') {
-			line->from = from;
-			line->to = i;
-			return true;
-		}
-	}
-	return false;
+static bool EndsSith(char *text, int textSize, char *suffix, int suffixSize)
+{
+    return textSize >= suffixSize && !strncmp(text+textSize-suffixSize, suffix, suffixSize);
 }
 
-static int skip_next_lines(char *text, int text_size, int line_count, int from) {
-	int next_line_from = from;
-	line_range curr = { 0 };
-
-	for (int i = 0; i < line_count; i++) {
-		if (!get_next_line(&curr, text, text_size, next_line_from)) break;
-		next_line_from = curr.to+1;
-	}
-
-	return next_line_from;
+static bool GetNextLine(LineRange *line, char *text, int textSize, int from)
+{
+    for (int i = from; i < textSize; i++) {
+        if (text[i] == '\n') {
+            line->from = from;
+            line->to = i;
+            return true;
+        }
+    }
+    return false;
 }
 
-static int find_start_of_function_block(char *raylib_api, int raylib_api_size) {
-	int next_line_from = 0;
-	line_range curr = { 0 };
-	while (get_next_line(&curr, raylib_api, raylib_api_size, next_line_from)) {
-		int line_size = curr.to - curr.from;
-		char *line = &raylib_api[curr.from];
+static int GetFunctionFromIdentifier(char *id, FunctionInfo *functions, int functionCount)
+{
+    int idSize = strlen(id);
 
-		if (line_size >= sizeof("Functions found:") && !strncmp(line, "Functions found:", sizeof("Functions found:")-1)) {
-			line_range next_line;
-			if (get_next_line(&next_line, raylib_api, raylib_api_size, curr.to+1)) {
-				return next_line.to+1;
-			} else {
-				return -1;
-			}
-		}
-
-		next_line_from = curr.to+1;
-	}
-
-	return -1;
+    for (int i = 0; i < functionCount; i++) {
+        FunctionInfo *function = &functions[i];
+        if (idSize > sizeof(function->name)) continue;
+        if (!strcmp(id, function->name)) {
+            return i;
+        }
+    }
+    return -1;
 }
 
-static bool parse_function_info(char *line, int line_size, function_info *info) {
-	char *name = strchr(line, ':') + 2;
-	int name_size = strchr(line, '(') - name;
-	strncpy(info->name, name, name_size);
-	info->name_size = name_size;
+static bool ParseFunctionUsagesFromFile(char *directory, char *filePath, FunctionUsage *usages[], int *usageCounts, FunctionInfo *functions, int functionCount)
+{
+    char fullPath[PATH_MAX] = { 0 };
+    snprintf(fullPath, sizeof(fullPath), "%s/%s", directory, filePath);
 
-	int param_count = strtoul(name + name_size + 4, NULL, 10);
-	info->param_count = param_count;
+    int fileSize = 0;
+    char *exampleCode = LoadFileText(fullPath, &fileSize);
+    if (exampleCode == NULL) {
+        return false;
+    }
 
-	return true;
+    stb_lexer lexer;
+    char stringStore[512];
+    stb_c_lexer_init(&lexer, exampleCode, exampleCode+fileSize, stringStore, sizeof(stringStore));
+
+    while (stb_c_lexer_get_token(&lexer)) {
+        if (lexer.token != CLEX_id) continue;
+
+        int functionIndex = GetFunctionFromIdentifier(lexer.string, functions, functionCount);
+        if (functionIndex != -1) {
+            int *usageCount = &usageCounts[functionIndex];
+            assert(*usageCount < MAX_FUNCS_PER_EXAMPLE);
+            FunctionUsage *usage = &usages[functionIndex][*usageCount];
+            strncpy(usage->filename, filePath, strlen(filePath));
+            (*usageCount)++;
+        }
+    }
+
+    free(exampleCode);
+
+    return true;
 }
 
-static int parse_funcs_from_raylib_api(char *raylib_api, int raylib_api_size, function_info *funcs, int max_funcs) {
-	int start_of_functions = find_start_of_function_block(raylib_api, raylib_api_size);
-	if (start_of_functions == -1) {
-		return -1;
-	}
+static void ParseFunctionsUsagesFromFolder(char *cwd, char *dir, FunctionUsage *usages[], int *usageCounts, FunctionInfo *functions, int functionCount)
+{
+    char dirPath[PATH_MAX];
+    snprintf(dirPath, sizeof(dirPath), "%s/%s", cwd, dir);
+    DIR *dirp = opendir(dirPath);
+    if (dirp == NULL) {
+        fprintf(stderr, "Failed to open directory '%s'\n", dirPath);
+        return;
+    }
 
-	int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dirp)) != NULL) {
+        if (entry->d_type != DT_REG) continue;
 
-	int next_line_from = start_of_functions;
-	line_range curr = { 0 };
-	while (get_next_line(&curr, raylib_api, raylib_api_size, next_line_from)) {
-		int line_size = curr.to - curr.from;
-		char *line = &raylib_api[curr.from];
+        char *extension = strrchr(entry->d_name, '.');
+        if (!strcmp(extension, ".c")) {
+            char filePath[PATH_MAX];
+            snprintf(filePath, sizeof(filePath), "%s/%s", dir, entry->d_name);
+            ParseFunctionUsagesFromFile(cwd, filePath, usages, usageCounts, functions, functionCount);
+        }
+    }
 
-		function_info *func_info = &funcs[count];
-		if (!parse_function_info(line, line_size, func_info)) {
-			fprintf(stderr, "Failed to parse function line: %.*s\n", line_size, line);
-			return -1;
-		}
-		count++;
-
-		int skip_count = 3 + MAX(func_info->param_count, 1);
-		next_line_from = skip_next_lines(raylib_api, raylib_api_size, skip_count, curr.to+1);
-
-		if (max_funcs == count) break;
-	}
-
-	return count;
+    closedir(dirp);
 }
 
-static int get_func_from_identifier(char *id, function_info *funcs, int func_count) {
-	int id_size = strlen(id);
-	for (int i = 0; i < func_count; i++) {
-		function_info *func = &funcs[i];
-		if (id_size != func->name_size) continue;
-		if (!strncmp(id, func->name, func->name_size)) {
-			return i;
-		}
-	}
-	return -1;
+// Checks if the line is in the format "#if defined(*_IMPLEMENTATION)"
+static bool IsLineImplementationIfdef(char *line, int line_size) {
+    char *prefix = "#if defined(";
+    char *suffix = "_IMPLEMENTATION)";
+    return StartsWith(line, line_size, prefix, strlen(prefix)) &&
+            EndsSith(line, line_size, suffix, strlen(suffix));
 }
 
-static bool collect_function_usages_from_file(char *directory, char *file_path, function_usage *usages[], int *usage_counts, function_info *funcs, int func_count) {
-	char full_path[PATH_MAX] = { 0 };
-	snprintf(full_path, sizeof(full_path), "%s/%s", directory, file_path);
-	FILE *file = fopen(full_path, "r");
-	if (file == NULL) {
-		fprintf(stderr, "Failed to open file '%s'\n", full_path);
-		return false;
-	}
+static int ParseFunctionsDefinitionsFromHeader(char *path, FunctionInfo *functions, int maxFunctions)
+{
+    int fileSize;
+    char *contents = LoadFileText(path, &fileSize);
 
-	int file_size = get_file_size(file);
-	char *example_code = malloc(file_size);
-	fread(example_code, sizeof(char), file_size, file);
+    int count = 0;
 
-	stb_lexer lexer;
-	char string_store[512];
-	stb_c_lexer_init(&lexer, example_code, example_code+file_size, string_store, sizeof(string_store));
-	while (stb_c_lexer_get_token(&lexer)) {
-		if (lexer.token != CLEX_id) continue;
+    int nextLineFrom = 0;
+    LineRange curr = { 0 };
+    while (GetNextLine(&curr, contents, fileSize, nextLineFrom)) {
+        int lineSize = curr.to - curr.from;
+        char line[512] = { 0 };
+        strncpy(line, &contents[curr.from], lineSize); // `raylib_parser.c` expects lines to be null-terminated
+        if (IsLineImplementationIfdef(line, lineSize)) break;
 
-		int func_idx = get_func_from_identifier(lexer.string, funcs, func_count);
-		if (func_idx != -1) {
-			stb_lex_location loc;
-			stb_c_lexer_get_location(&lexer, lexer.where_firstchar, &loc);
-			int *usage_count = &usage_counts[func_idx];
-			assert(*usage_count < MAX_FUNC_USAGES);
-			function_usage *usage = &usages[func_idx][*usage_count];
-			usage->line_number = loc.line_number;
-			usage->line_offset = loc.line_offset;
-			strncpy(usage->filename, file_path, strlen(file_path));
-			(*usage_count)++;
-		}
-	}
+        if (IsLineAPIFunction(line, lineSize)) {
+            ParseAPIFunctionInfo(line, lineSize, &functions[count]);
+            count++;
+            if (count == maxFunctions) break;
+        }
 
-	free(example_code);
-	fclose(file);
+        nextLineFrom = curr.to+1;
+    }
 
-	return true;
+    free(contents);
+
+    return count;
 }
 
-static void collect_function_usages_from_folder(char *cwd, char *dir, function_usage *usages[], int *usage_counts, function_info *funcs, int func_count) {
-	char dir_path[PATH_MAX];
-	snprintf(dir_path, sizeof(dir_path), "%s/%s", cwd, dir);
-	DIR *dirp = opendir(dir_path);
-	if (dirp == NULL) {
-		fprintf(stderr, "Failed to open directory '%s'\n", dir_path);
-		return;
-	}
+static int ParseFunctionsDefinitionsFromFolder(char *dir, FunctionInfo *functions, int maxFunctions)
+{
+    DIR *dirp = opendir(dir);
+    if (dirp == NULL) {
+        fprintf(stderr, "Failed to open directory '%s'\n", dir);
+        return -1;
+    }
 
-	struct dirent *entry;
-	while ((entry = readdir(dirp)) != NULL) {
-		if (entry->d_type != DT_REG) continue;
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dirp)) != NULL) {
+        if (entry->d_type != DT_REG) continue;
 
-		char *extension = strrchr(entry->d_name, '.');
-		if (!strcmp(extension, ".c")) {
-			char file_path[PATH_MAX];
-			snprintf(file_path, sizeof(file_path), "%s/%s", dir, entry->d_name);
-			collect_function_usages_from_file(cwd, file_path, usages, usage_counts, funcs, func_count);
-		}
-	}
+        char *fileExtension = strrchr(entry->d_name, '.');
+        if (fileExtension == NULL) continue;
+        if (strcmp(fileExtension, ".h")) continue;
 
-	closedir(dirp);
+        char path[256];
+        snprintf(path, sizeof(path), "%s/%s", dir, entry->d_name);
+        count += ParseFunctionsDefinitionsFromHeader(path, functions + count, maxFunctions - count);
+    }
+    closedir(dirp);
+
+    return count;
 }
 
-int main(int argc, char **argv) {
-	if (argc != 4) {
-		printf("Usage: %s <raylib_api.txt> <examples-dir> <output-file>\n", argv[0]);
-		return -1;
-	}
+static int GetUniqueFilenames(FunctionUsage *usages, int usageCount, char *uniqueFilenames[])
+{
+    int count = 0;
 
-	char *raylib_api_path = argv[1];
-	char *raylib_examples_path = argv[2];
-	char *output_path = argv[3];
+    for (int i = 0; i < usageCount; i++) {
+        FunctionUsage *usage = &usages[i];
 
-	char *output_extension = strrchr(output_path, '.');
-	if (output_extension == NULL) {
-		fprintf(stderr, "ERROR: Missing extension on output file\n");
-		return -1;
-	}
+        bool found = false;
+        for (int j = 0; j < count; j++) {
+            if (!strcmp(uniqueFilenames[j], usage->filename)) {
+                found = true;
+                break;
+            }
+        }
 
-	function_info funcs[MAX_FUNCS_TO_PARSE];
-	int funcs_count = 0;
+        if (!found) {
+            uniqueFilenames[count] = strdup(usage->filename);
+            count++;
+        }
+    }
 
-	{ // Collect function definitions
-		FILE *raylib_api_file = fopen(raylib_api_path, "r");
-		if (raylib_api_file == NULL) {
-			fprintf(stderr, "Failed to open file '%s'\n", raylib_api_path);
-			return -1;
-		}
-		int raylib_api_size = get_file_size(raylib_api_file);
-		char *raylib_api = malloc(raylib_api_size);
-		fread(raylib_api, sizeof(char), raylib_api_size, raylib_api_file);
-		fclose(raylib_api_file);
+    return count;
+}
 
-		funcs_count = parse_funcs_from_raylib_api(raylib_api, raylib_api_size, funcs, MAX_FUNCS_TO_PARSE);
+static int OutputFunctionUsagesJSON(char *output, FunctionInfo *functions, int functionCount, FunctionUsage **usages, int *usageCounts)
+{
+    FILE *outputFile = fopen(output, "w");
+    if (outputFile == NULL) {
+        fprintf(stderr, "Failed to open file '%s\n'", output);
+        return -1;
+    }
 
-		free(raylib_api);
-	}
+    fwrite("{", sizeof(char), 1, outputFile);
+    for (int functionIndex = 0; functionIndex < functionCount; functionIndex++) {
+        FunctionInfo *info = &functions[functionIndex];
 
-	function_usage *usages[MAX_FUNCS_TO_PARSE] = { 0 };
-	for (int i = 0; i < funcs_count; i++) {
-		usages[i] = malloc(MAX_FUNC_USAGES * sizeof(function_usage));
-	}
-	int usage_counts[MAX_FUNCS_TO_PARSE] = { 0 };
+        fwrite("\"", sizeof(char), 1, outputFile);
+        fwrite(info->name, sizeof(char), strlen(info->name), outputFile);
+        fwrite("\":[", sizeof(char), 3, outputFile);
 
-	{ // Collect function usages
-		DIR *dirp = opendir(raylib_examples_path);
-		if (dirp == NULL) {
-			fprintf(stderr, "Failed to open directory '%s'\n", raylib_examples_path);
-			return -1;
-		}
-		struct dirent *entry;
-		while ((entry = readdir(dirp)) != NULL) {
-			if (entry->d_type != DT_DIR) continue;
-			if (entry->d_name[0] == '.') continue;
+        int usageCount = usageCounts[functionIndex];
+        if (usageCount > 0) {
+            char *uniqueFilenames[usageCount];
+            int uniqueCount = GetUniqueFilenames(usages[functionIndex], usageCount, uniqueFilenames);
 
-			collect_function_usages_from_folder(raylib_examples_path, entry->d_name, usages, usage_counts, funcs, funcs_count);
-		}
-		closedir(dirp);
-	}
+            for (int i = 0; i < uniqueCount; i++) {
+                char *filename = uniqueFilenames[i];
+                char *example_name = strchr(filename, '/')+1;
+                int example_name_size = strchr(filename, '.') - example_name;
 
-	// Output function usages
-	FILE *output_file = fopen(output_path, "w");
-	if (output_file == NULL) {
-		fprintf(stderr, "Failed to open file '%s\n'", output_path);
-		return -1;
-	}
+                fwrite("\"", sizeof(char), 1, outputFile);
+                fwrite(example_name, sizeof(char), example_name_size, outputFile);
+                fwrite("\"", sizeof(char), 1, outputFile);
+                if (i < uniqueCount-1) {
+                    fwrite(",", sizeof(char), 1, outputFile);
+                }
+            }
 
-	fwrite("{\n", sizeof(char), 2, output_file);
-	for (int func_idx = 0; func_idx < funcs_count; func_idx++) {
-		function_info *info = &funcs[func_idx];
+            for (int i = 0; i < uniqueCount; i++) {
+                free(uniqueFilenames[i]);
+            }
+        }
 
-		fwrite("\t\"", sizeof(char), 2, output_file);
-		fwrite(info->name, sizeof(char), info->name_size, output_file);
-		fwrite("\": [", sizeof(char), 4, output_file);
+        fwrite("]", sizeof(char), 1, outputFile);
+        if (functionIndex < functionCount-1) {
+            fwrite(",", sizeof(char), 1, outputFile);
+        }
+    }
 
-		int usage_count = usage_counts[func_idx];
-		if (usage_count > 0) {
-			fwrite("\n", sizeof(char), 1, output_file);
+    fwrite("}", sizeof(char), 1, outputFile);
+    fclose(outputFile);
 
-			for (int i = 0; i < usage_count; i++) {
-				function_usage *usage = &usages[func_idx][i];
-				char *example_name = strchr(usage->filename, '/')+1;
-				int example_name_size = strchr(usage->filename, '.') - example_name;
+    return 0;
+}
 
-				char *entry_format = ""
-					"\t\t{\n"
-					"\t\t\t\"exampleName\": \"%.*s\",\n"
-					"\t\t\t\"lineNumber\": %d,\n"
-					"\t\t\t\"lineOffset\": %d\n"
-					"\t\t}";
-				char entry[1024];
-				int entry_size = snprintf(entry, sizeof(entry), entry_format,
-						example_name_size,
-						example_name,
-						usage->line_number,
-						usage->line_offset);
+int main(int argc, char **argv)
+{
+    if (argc != 4) {
+        printf("Usage: %s <raylib-src-dir> <examples-dir> <output-file>\n", argv[0]);
+        return -1;
+    }
 
-				fwrite(entry, sizeof(char), entry_size, output_file);
-				if (i < usage_count-1) {
-					fwrite(",", sizeof(char), 1, output_file);
-				}
-				fwrite("\n", sizeof(char), 1, output_file);
-			}
+    char *raylibSrc = argv[1];
+    char *raylibExamplesPath = argv[2];
+    char *outputPath = argv[3];
 
-			fwrite("\t", sizeof(char), 1, output_file);
-		}
+    FunctionInfo functions[MAX_FUNCS_TO_PARSE];
+    int functionCount = ParseFunctionsDefinitionsFromFolder(raylibSrc, functions, MAX_FUNCS_TO_PARSE);
+    if (functionCount < 0) {
+        return -1;
+    }
 
-		fwrite("]", sizeof(char), 1, output_file);
-		if (func_idx < funcs_count-1) {
-			fwrite(",", sizeof(char), 1, output_file);
-		}
-		fwrite("\n", sizeof(char), 1, output_file);
-	}
+    FunctionUsage *usages[MAX_FUNCS_TO_PARSE] = { 0 };
+    for (int i = 0; i < functionCount; i++) {
+        usages[i] = malloc(MAX_FUNCS_PER_EXAMPLE * sizeof(FunctionUsage));
+    }
+    int usageCounts[MAX_FUNCS_TO_PARSE] = { 0 };
 
-	fwrite("}", sizeof(char), 1, output_file);
-	fclose(output_file);
+    { // Collect function usages from examples
+        DIR *dirp = opendir(raylibExamplesPath);
+        if (dirp == NULL) {
+            fprintf(stderr, "Failed to open directory '%s'\n", raylibExamplesPath);
+            return -1;
+        }
+        struct dirent *entry;
+        while ((entry = readdir(dirp)) != NULL) {
+            if (entry->d_type != DT_DIR) continue;
+            if (entry->d_name[0] == '.') continue;
 
-	for (int i = 0; i < funcs_count; i++) {
-		free(usages[i]);
-	}
+            ParseFunctionsUsagesFromFolder(raylibExamplesPath, entry->d_name, usages, usageCounts, functions, functionCount);
+        }
+        closedir(dirp);
+    }
 
-	return 0;
+    // Output function usages
+    OutputFunctionUsagesJSON(outputPath, functions, functionCount, usages, usageCounts);
+
+    for (int i = 0; i < functionCount; i++) {
+        free(usages[i]);
+    }
+
+    return 0;
 }

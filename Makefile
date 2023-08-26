@@ -1,22 +1,20 @@
-.DEFAULT_GOAL := run
+BUILD_DIR := build
+
+.DEFAULT_GOAL := all
 .PHONY := raylib_example_indexer all clean
 
-raylib_example_indexer: src/main.c
-	mkdir -p output
-	gcc src/main.c -o output/raylib_example_indexer -I./external -DSTB_C_LEXER_IMPLEMENTATION
+example_indexer: src/main.c
+	mkdir -p $(BUILD_DIR)
+	gcc src/main.c -o $(BUILD_DIR)/example_indexer -I./external -DSTB_C_LEXER_IMPLEMENTATION
 
-raylib_api:
-	mkdir -p output
-	curl https://raw.githubusercontent.com/raysan5/raylib/master/parser/output/raylib_api.txt -o output/raylib_api.txt
+$(BUILD_DIR)/raylib:
+	mkdir -p $(BUILD_DIR)
+	git clone git@github.com:raysan5/raylib.git $(BUILD_DIR)/raylib
 
-raylib:
-	mkdir -p output
-	git clone git@github.com:raysan5/raylib.git output/raylib
+run: example_indexer
+	./$(BUILD_DIR)/example_indexer $(BUILD_DIR)/raylib/src $(BUILD_DIR)/raylib/examples $(BUILD_DIR)/output.json
 
-run: raylib_example_indexer
-	./output/raylib_example_indexer output/raylib_api.txt output/raylib/examples output/output.json
-
-all: raylib_api raylib run
+all: $(BUILD_DIR)/raylib example_indexer run
 
 clean:
-	rm -rf output
+	rm -rf $(BUILD_DIR)
